@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable, Iterable, Sequence
+import copy
+import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import cloudpickle
 import torch.nn as nn
@@ -305,6 +307,29 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         profiler_config_instance = _make_config(profiler_config, ProfilerConfig)
         attention_config_instance = _make_config(attention_config, AttentionConfig)
 
+        self.cuda_visible_devices = kwargs.pop("cuda_visible_devices", None)
+
+        self.priming_llm: Optional["LLM"] = None
+        self.num_priming_tokens: int = 0
+        if "priming_config" in kwargs:
+            priming_config = kwargs.pop("priming_config").copy()
+            self.num_priming_tokens = priming_config.pop("num_priming_tokens",
+                                                         128)
+
+            priming_cuda = priming_config.pop("cuda_visible_devices", None)
+            if priming_cuda is not None:
+                old_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(priming_cuda)
+                try:
+                    self.priming_llm = LLM(**priming_config)
+                finally:
+                    if old_cuda is None:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                    else:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda
+            else:
+                self.priming_llm = LLM(**priming_config)
+
         # warn about single-process data parallel usage.
         _dp_size = int(kwargs.get("data_parallel_size", 1))
         _distributed_executor_backend = kwargs.get("distributed_executor_backend")
@@ -364,9 +389,23 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
 
         log_non_default_args(engine_args)
 
-        self.llm_engine = LLMEngine.from_engine_args(
-            engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
-        )
+        if self.cuda_visible_devices is not None:
+            old_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.cuda_visible_devices)
+            try:
+                self.llm_engine = LLMEngine.from_engine_args(
+                    engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
+                )
+            finally:
+                if old_cuda is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda
+        else:
+            self.llm_engine = LLMEngine.from_engine_args(
+                engine_args=engine_args, usage_context=UsageContext.LLM_CLASS
+            )
+
         self.model_config = self.llm_engine.model_config
         self.engine_class = type(self.llm_engine)
 
@@ -475,6 +514,88 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
 
         if sampling_params is None:
             sampling_params = self.get_default_sampling_params()
+
+        if self.priming_llm is not None:
+            seq_prompts = prompt_to_seq(prompts)
+            seq_sampling_params = self._params_to_seq(sampling_params,
+                                                      len(seq_prompts))
+
+            # 1. Priming generation
+            priming_sampling_params = []
+            for sp in seq_sampling_params:
+                psp = copy.deepcopy(sp)
+                psp.max_tokens = self.num_priming_tokens
+                if psp.min_tokens > self.num_priming_tokens:
+                    psp.min_tokens = self.num_priming_tokens
+                priming_sampling_params.append(psp)
+
+            priming_outputs = self.priming_llm.generate(
+                prompts=seq_prompts,
+                sampling_params=priming_sampling_params,
+                use_tqdm=use_tqdm,
+                lora_request=lora_request,
+                priority=priority,
+                tokenization_kwargs=tokenization_kwargs,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+
+            # 2. Prepare prompts for main model
+            new_prompts = []
+            new_sampling_params = []
+            tokenizer = self.get_tokenizer()
+
+            for i, (orig_prompt,
+                    priming_output) in enumerate(zip(seq_prompts,
+                                                     priming_outputs)):
+                # Get original tokens
+                if isinstance(orig_prompt, str):
+                    orig_token_ids = tokenizer.encode(orig_prompt)
+                elif isinstance(orig_prompt, list):
+                    orig_token_ids = orig_prompt
+                elif isinstance(orig_prompt, dict):
+                    if "prompt_token_ids" in orig_prompt:
+                        orig_token_ids = orig_prompt["prompt_token_ids"]
+                    elif "prompt" in orig_prompt:
+                        orig_token_ids = tokenizer.encode(orig_prompt["prompt"])
+                    else:
+                        raise ValueError(
+                            f"Unsupported prompt dict: {orig_prompt}")
+                else:
+                    raise ValueError(
+                        f"Unsupported prompt type: {type(orig_prompt)}")
+
+                generated_tokens = priming_output.outputs[0].token_ids
+                combined_tokens = orig_token_ids + list(generated_tokens)
+
+                if isinstance(orig_prompt, dict):
+                    new_prompt = orig_prompt.copy()
+                    new_prompt["prompt_token_ids"] = combined_tokens
+                    if "prompt" in new_prompt:
+                        new_prompt["prompt"] = (new_prompt["prompt"] +
+                                                priming_output.outputs[0].text)
+                else:
+                    new_prompt = {"prompt_token_ids": combined_tokens}
+                    if isinstance(orig_prompt, str):
+                        new_prompt["prompt"] = (orig_prompt +
+                                                priming_output.outputs[0].text)
+
+                new_prompts.append(new_prompt)
+
+                # Adjust sampling params
+                sp = seq_sampling_params[i]
+                nsp = copy.deepcopy(sp)
+                if nsp.max_tokens is not None:
+                    nsp.max_tokens = max(
+                        1, nsp.max_tokens - len(generated_tokens))
+                if nsp.min_tokens > 0:
+                    nsp.min_tokens = max(0,
+                                         nsp.min_tokens - len(generated_tokens))
+                if nsp.max_tokens is not None and nsp.min_tokens > nsp.max_tokens:
+                    nsp.min_tokens = nsp.max_tokens
+                new_sampling_params.append(nsp)
+
+            prompts = new_prompts
+            sampling_params = new_sampling_params
 
         return self._run_completion(
             prompts=prompts,
