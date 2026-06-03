@@ -310,25 +310,26 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
         self.cuda_visible_devices = kwargs.pop("cuda_visible_devices", None)
 
         self.priming_llm: Optional["LLM"] = None
+        self.priming_config_dict = None
         self.num_priming_tokens: int = 0
         if "priming_config" in kwargs:
-            priming_config = kwargs.pop("priming_config").copy()
-            self.num_priming_tokens = priming_config.pop("num_priming_tokens",
-                                                         128)
+            self.priming_config_dict = kwargs.pop("priming_config").copy()
+            self.num_priming_tokens = self.priming_config_dict.pop("num_priming_tokens",
+                                                              128)
 
-            priming_cuda = priming_config.pop("cuda_visible_devices", None)
+            priming_cuda = self.priming_config_dict.get("cuda_visible_devices", None)
             if priming_cuda is not None:
                 old_cuda = os.environ.get("CUDA_VISIBLE_DEVICES")
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(priming_cuda)
                 try:
-                    self.priming_llm = LLM(**priming_config)
+                    self.priming_llm = LLM(**self.priming_config_dict)
                 finally:
                     if old_cuda is None:
                         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                     else:
                         os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda
             else:
-                self.priming_llm = LLM(**priming_config)
+                self.priming_llm = LLM(**self.priming_config_dict)
 
         # warn about single-process data parallel usage.
         _dp_size = int(kwargs.get("data_parallel_size", 1))
@@ -384,6 +385,8 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin):
             spec_method=spec_method,
             spec_model=spec_model,
             spec_tokens=spec_tokens,
+            cuda_visible_devices=self.cuda_visible_devices,
+            priming_config=self.priming_config_dict,
             **kwargs,
         )
 

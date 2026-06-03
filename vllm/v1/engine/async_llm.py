@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import copy
 import os
 import socket
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
-from copy import copy
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -166,6 +166,15 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         self._client_count = client_count
+
+        self.priming_llm: Optional["LLM"] = None
+        self.num_priming_tokens: int = 0
+        if self.vllm_config.priming_config:
+            from vllm.entrypoints.llm import LLM
+            priming_config = self.vllm_config.priming_config.copy()
+            self.num_priming_tokens = priming_config.pop("num_priming_tokens",
+                                                         128)
+            self.priming_llm = LLM(**priming_config)
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -389,7 +398,7 @@ class AsyncLLM(EngineClient):
         parent_request = ParentRequest(request)
         for idx in range(parent_params.n):
             request_id, child_params = parent_request.get_child_info(idx)
-            child_request = request if idx == parent_params.n - 1 else copy(request)
+            child_request = request if idx == parent_params.n - 1 else copy.copy(request)
             child_request.request_id = request_id
             child_request.sampling_params = child_params
             await self._add_request(
@@ -556,6 +565,76 @@ class AsyncLLM(EngineClient):
 
         q: RequestOutputCollector | None = None
         try:
+            priming_output = None
+            original_prompt_str = None
+            orig_token_ids = None
+
+            if self.priming_llm is not None:
+                # 1. Priming generation (using run_in_executor to avoid blocking)
+                psp = copy.deepcopy(sampling_params)
+                psp.max_tokens = self.num_priming_tokens
+                if psp.min_tokens > self.num_priming_tokens:
+                    psp.min_tokens = self.num_priming_tokens
+
+                loop = asyncio.get_running_loop()
+                priming_outputs = await loop.run_in_executor(
+                    None,
+                    self.priming_llm.generate,
+                    prompt,
+                    psp,
+                )
+                priming_output = priming_outputs[0]
+                generated_tokens = priming_output.outputs[0].token_ids
+                priming_text = priming_output.outputs[0].text
+
+                # 2. Prepare prompt for main model
+                tokenizer = self.priming_llm.get_tokenizer()
+                if isinstance(prompt, str):
+                    orig_token_ids = tokenizer.encode(prompt)
+                    original_prompt_str = prompt
+                elif isinstance(prompt, list):
+                    orig_token_ids = prompt
+                    original_prompt_str = None
+                elif isinstance(prompt, dict):
+                    if "prompt_token_ids" in prompt:
+                        orig_token_ids = prompt["prompt_token_ids"]
+                    elif "prompt" in prompt:
+                        orig_token_ids = tokenizer.encode(prompt["prompt"])
+                    else:
+                        orig_token_ids = []
+                    original_prompt_str = prompt.get("prompt")
+                else:
+                    orig_token_ids = []
+                    original_prompt_str = None
+
+                combined_tokens = orig_token_ids + list(generated_tokens)
+
+                if isinstance(prompt, dict):
+                    new_prompt = prompt.copy()
+                    new_prompt["prompt_token_ids"] = combined_tokens
+                    if "prompt" in new_prompt:
+                        new_prompt["prompt"] = new_prompt["prompt"] + priming_text
+                else:
+                    new_prompt = {"prompt_token_ids": combined_tokens}
+                    if isinstance(prompt, str):
+                        new_prompt["prompt"] = prompt + priming_text
+
+                prompt = new_prompt
+
+                # Adjust sampling params
+                if sampling_params.max_tokens is not None:
+                    sampling_params = copy.deepcopy(sampling_params)
+                    sampling_params.max_tokens = max(
+                        1, sampling_params.max_tokens - len(generated_tokens))
+                if sampling_params.min_tokens > 0:
+                    sampling_params.min_tokens = max(
+                        0,
+                        sampling_params.min_tokens - len(generated_tokens))
+                if (sampling_params.max_tokens is not None
+                        and sampling_params.min_tokens
+                        > sampling_params.max_tokens):
+                    sampling_params.min_tokens = sampling_params.max_tokens
+
             q = await self.add_request(
                 request_id,
                 prompt,
@@ -583,6 +662,17 @@ class AsyncLLM(EngineClient):
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
                 if out is not STREAM_FINISHED:
+                    if priming_output is not None:
+                        out.prompt = original_prompt_str
+                        out.prompt_token_ids = orig_token_ids
+                        for i, comp_out in enumerate(out.outputs):
+                            priming_comp = priming_output.outputs[i] if i < len(priming_output.outputs) else priming_output.outputs[0]
+                            # Prepend to text if they are not already prepended
+                            # wait, out.outputs are cumulative for final request output, and cumulative if not streaming
+                            # if it's delta, we should prepend only for the FIRST chunk.
+                            # But V1 doesn't have delta output kinds like this.
+                            comp_out.text = priming_comp.text + comp_out.text
+                            comp_out.token_ids = tuple(list(priming_comp.token_ids) + list(comp_out.token_ids))
                     yield out
 
         # If the request is disconnected by the client, generate()

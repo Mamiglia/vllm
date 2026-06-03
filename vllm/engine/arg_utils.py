@@ -460,6 +460,7 @@ class EngineArgs:
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    cuda_visible_devices: str | None = None
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend = ParallelConfig.dcp_comm_backend
@@ -607,6 +608,7 @@ class EngineArgs:
     reasoning_parser_plugin: str | None = None
 
     speculative_config: dict[str, Any] | None = None
+    priming_config: dict[str, Any] | None = None
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
@@ -960,6 +962,13 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
+        )
+        parallel_group.add_argument(
+            "--cuda-visible-devices",
+            type=str,
+            default=None,
+            help="Comma-separated list of GPU IDs to use for this model. "
+            "If set, vLLM will programmatically isolate these GPUs."
         )
         parallel_group.add_argument(
             "--decode-context-parallel-size",
@@ -1441,6 +1450,10 @@ class EngineArgs:
         vllm_kwargs["speculative_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
             "--speculative-config", "-sc", **vllm_kwargs["speculative_config"]
+        )
+        vllm_kwargs["priming_config"]["type"] = optional_type(json.loads)
+        vllm_group.add_argument(
+            "--priming-config", **vllm_kwargs["priming_config"]
         )
         speculative_kwargs = get_kwargs(SpeculativeConfig)
         vllm_group.add_argument("--spec-method", **speculative_kwargs["method"])
@@ -2216,6 +2229,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
+            priming_config=self.priming_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,
             compilation_config=compilation_config,

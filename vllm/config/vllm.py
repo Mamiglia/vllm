@@ -311,6 +311,8 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
+    priming_config: dict[str, Any] | None = None
+    """Priming configuration."""
     structured_outputs_config: StructuredOutputsConfig = Field(
         default_factory=StructuredOutputsConfig
     )
