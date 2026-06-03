@@ -1,110 +1,118 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# Primed Generation in vLLM
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
-
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
-
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+This guide explains how to use the **"Primed Generation"** feature in vLLM. Priming is a technique where a "starter" model generates the first $k$ tokens of a response, and then a larger or more capable "completer" (main) model takes over to finish the sequence.
 
 ---
 
-## About
+## 1. How to Use Primed Generation
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+The priming feature is fully integrated into both the standard Python API (offline inference) and the OpenAI-compatible API server.
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+### Configuration Parameters
+You configure priming by passing a `priming_config` dictionary (or JSON string). The key parameters are:
+- `model`: The huggingface model ID for the starter model.
+- `num_priming_tokens`: The exact number of tokens the starter model should generate (e.g., `128`).
+- `cuda_visible_devices`: (Optional) Comma-separated GPU IDs to restrict the starter model to specific GPUs.
+- Any other standard vLLM argument (e.g., `gpu_memory_utilization`, `tensor_parallel_size`, `max_model_len`).
 
-vLLM is fast with:
+*Note: You can also use `--cuda-visible-devices` on the main model to strictly isolate the main model and the priming model on different GPUs.*
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+### A. Offline Python API Usage
 
-vLLM is flexible and easy to use with:
+```python
+from vllm import LLM, SamplingParams
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+# Initialize the main model (Completer) on GPU 0
+llm = LLM(
+    model="Qwen/Qwen3.5-0.8B",
+    cuda_visible_devices="0",
+    max_model_len=32768,
+    priming_config={
+        # Initialize the starter model on GPU 1
+        "model": "Qwen/Qwen3.5-4B",
+        "num_priming_tokens": 128,
+        "cuda_visible_devices": "1",
+        "gpu_memory_utilization": 0.4,
+        "max_model_len": 32768,
+    },
+)
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+# Total sequence length (including the 128 priming tokens) will be 256
+sampling_params = SamplingParams(max_tokens=256, temperature=0.7)
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+prompts = [
+    "The philosophical implications of sentient AI are profound because",
+    "Artificial intelligence is a branch of computer science that"
+]
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+outputs = llm.generate(prompts, sampling_params)
 
-## Getting Started
+for out in outputs:
+    print(f"Prompt: {out.prompt}")
+    print(f"Generated text: {out.outputs[0].text}")
+```
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+### B. Standard vLLM CLI (API Server) Usage
 
+You can launch the OpenAI-compatible server with priming enabled using the standard `vllm serve` CLI (or `api_server` module).
+
+**1. Start the server:**
 ```bash
-uv pip install vllm
+# Main model on GPU 1, Starter model on GPU 2
+python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen3.5-0.8B \
+    --cuda-visible-devices 1 \
+    --gpu-memory-utilization 0.4 \
+    --max-model-len 32768 \
+    --priming-config '{
+        "model": "Qwen/Qwen3.5-4B", 
+        "num_priming_tokens": 128, 
+        "cuda_visible_devices": "2", 
+        "gpu_memory_utilization": 0.4, 
+        "max_model_len": 32768
+    }'
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+**2. Query the Chat Completions endpoint:**
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{
+           "model": "Qwen/Qwen3.5-0.8B",
+           "messages": [
+             {"role": "system", "content": "You are a helpful and detailed AI assistant."},
+             {"role": "user", "content": "Explain the significance of the Turing Test in the history of artificial intelligence."}
+           ],
+           "max_tokens": 256,
+           "temperature": 0.7
+         }'
 ```
+*The server will use the starter model for the first 128 tokens, seamlessly hand off to the main model for the remaining 128 tokens, and return a perfectly formatted OpenAI JSON response with accurate token counts.*
 
-## Contact Us
+---
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+## 2. Implementation Details: What, How, and Why
 
-## Media Kit
+### What was modified
+To support this feature gracefully, surgical edits were made to the core entrypoints and configuration files of the vLLM repository:
+- `vllm/config/vllm.py`: Added `priming_config` to `VllmConfig`.
+- `vllm/engine/arg_utils.py`: Added CLI arguments `--priming-config` and `--cuda-visible-devices` and plumbed them into the `EngineArgs` dataclass.
+- `vllm/entrypoints/llm.py`: Modified the offline `LLM` class to support instantiating and orchestrating the priming model.
+- `vllm/v1/engine/async_llm.py`: Modified the `AsyncLLM` class (used by the API server) to asynchronously execute the priming phase and stitch the results into the final output stream.
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+### How it was implemented
+1. **Model Initialization**: When `priming_config` is provided in the configuration, a secondary, entirely independent `LLM` instance (`self.priming_llm`) is instantiated.
+2. **GPU Isolation**: A context manager temporarily alters the `CUDA_VISIBLE_DEVICES` environment variable during the initialization of the engines. This ensures that the main engine and the priming engine do not collide or compete for memory on the same GPU.
+3. **The `generate` Intercept**:
+   - Both `LLM.generate` and `AsyncLLM.generate` were intercepted.
+   - Before handing the request to the main engine, a request is sent to `self.priming_llm` to generate exactly `num_priming_tokens`.
+   - The original user prompt token IDs are concatenated with the generated priming token IDs to create an extended prompt.
+   - The user's `SamplingParams` are deep-copied, and properties like `max_tokens` and `min_tokens` are dynamically decreased by `num_priming_tokens`.
+   - The extended prompt is then passed to the main engine for completion.
+4. **Asynchronous Execution**: In `AsyncLLM`, the synchronous priming generation is wrapped in `asyncio.get_running_loop().run_in_executor()` to prevent the offline priming model from blocking the API server's event loop.
+5. **Output Reconstruction**: In `AsyncLLM`, the generated priming text is dynamically prepended to the `RequestOutput` chunks yielded by the main engine. The original prompt (before priming) is restored on the output object. This tricks the OpenAI API wrapper into correctly counting the original prompt tokens while returning the fully merged text stream.
+
+### Why it was implemented this way
+- **Surgical and Non-Invasive**: By intercepting the top-level `generate` methods rather than digging into the core `EngineCore`, `Scheduler`, or `PagedAttention` mechanisms, the implementation avoids breaking vLLM's highly optimized continuous batching and memory management logic.
+- **Resource Safety**: Instantiating a completely separate `LLM` object guarantees that the models do not share KV caches, CUDA graphs, or internal states. Using `CUDA_VISIBLE_DEVICES` ensures no NCCL or memory contention occurs when running two models in the same Python process.
+- **Compatibility**: The implementation is completely compatible with vLLM V1 architecture optimizations, including **torch.compile**, **CUDA Graphs**, and the **OpenAI API Server** standard formatting. By restoring the original prompt strings on the output object, tools like `curl` and the OpenAI Python SDK remain completely unaware that a handoff occurred.
