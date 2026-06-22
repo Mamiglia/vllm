@@ -169,12 +169,21 @@ class AsyncLLM(EngineClient):
 
         self.priming_llm: Optional["LLM"] = None
         self.num_priming_tokens: int = 0
+        self.priming_queue = asyncio.Queue()
+        self.priming_worker_task = None
         if self.vllm_config.priming_config:
             from vllm.entrypoints.llm import LLM
             priming_config = self.vllm_config.priming_config.copy()
             self.num_priming_tokens = priming_config.pop("num_priming_tokens",
                                                          128)
             self.priming_llm = LLM(**priming_config)
+            try:
+                asyncio.get_running_loop()
+                self.priming_worker_task = asyncio.create_task(
+                    self._priming_batch_worker())
+            except RuntimeError:
+                pass
+
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -525,6 +534,58 @@ class AsyncLLM(EngineClient):
                 "or with stop strings."
             )
 
+    async def _priming_batch_worker(self):
+        batch_delay = 0.01  # 10ms grouping window
+        max_batch_size = 128
+        while True:
+            try:
+                item = await self.priming_queue.get()
+                items = [item]
+                start_time = time.time()
+                while len(items) < max_batch_size:
+                    time_remaining = batch_delay - (time.time() - start_time)
+                    if time_remaining <= 0:
+                        break
+                    try:
+                        next_item = await asyncio.wait_for(
+                            self.priming_queue.get(),
+                            timeout=max(0.001, time_remaining)
+                        )
+                        items.append(next_item)
+                    except asyncio.TimeoutError:
+                        break
+
+                prompts = [x[0] for x in items]
+                psps = [x[1] for x in items]
+                futures = [x[2] for x in items]
+
+                loop = asyncio.get_running_loop()
+                try:
+                    priming_outputs = await loop.run_in_executor(
+                        None,
+                        lambda: self.priming_llm.generate(
+                            prompts=prompts,
+                            sampling_params=psps,
+                            use_tqdm=False
+                        )
+                    )
+                    for i, fut in enumerate(futures):
+                        if not fut.cancelled():
+                            fut.set_result(priming_outputs[i])
+                except Exception as e:
+                    for fut in futures:
+                        if not fut.cancelled():
+                            fut.set_exception(e)
+                finally:
+                    for _ in range(len(items)):
+                        self.priming_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Error in priming batch worker: {e}")
+                await asyncio.sleep(0.1)
+
     # TODO: we should support multiple prompts in one call, as you
     # can do with LLM.generate. So that for multi-prompt completion
     # requests we don't need to send multiple messages to core proc,
@@ -576,14 +637,14 @@ class AsyncLLM(EngineClient):
                 if psp.min_tokens > self.num_priming_tokens:
                     psp.min_tokens = self.num_priming_tokens
 
+                if self.priming_worker_task is None or self.priming_worker_task.done():
+                    self.priming_worker_task = asyncio.create_task(
+                        self._priming_batch_worker())
+
                 loop = asyncio.get_running_loop()
-                priming_outputs = await loop.run_in_executor(
-                    None,
-                    self.priming_llm.generate,
-                    prompt,
-                    psp,
-                )
-                priming_output = priming_outputs[0]
+                fut = loop.create_future()
+                await self.priming_queue.put((prompt, psp, fut))
+                priming_output = await fut
                 generated_tokens = priming_output.outputs[0].token_ids
                 priming_text = priming_output.outputs[0].text
 
